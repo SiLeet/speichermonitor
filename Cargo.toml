@@ -1,0 +1,31 @@
+[package]
+name = "speichermonitor"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "Speichermonitor"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "wgpu"] }
+rayon = "1"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Diagnostics_ToolHelp",
+]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+
+[build-dependencies]
+embed-resource = "3"
