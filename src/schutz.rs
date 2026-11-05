@@ -4,6 +4,7 @@ use crate::scan::{ATTR_ORDNER, ATTR_REPARSE};
 use std::fs;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::time::SystemTime;
 
 /// Kleinschreibung, `\` statt `/`; nur absolute Laufwerkspfade ohne `..`.
 pub fn norm(p: &Path) -> Option<PathBuf> {
@@ -131,13 +132,38 @@ impl Bilanz {
 /// Löscht den INHALT von `dir` endgültig. Junctions/Symlinks darin werden nur als
 /// Verweis entfernt, nie verfolgt. Ist `dir` selbst eine Verknüpfung: nichts tun.
 pub fn leere_ordner(dir: &Path, b: &mut Bilanz) {
+    leere_ordner_vor(dir, None, b);
+}
+
+/// Mit `vor`: nur Dateien, die seit `vor` unverändert sind - jüngere bleiben, ohne zu zählen.
+pub fn leere_ordner_vor(dir: &Path, vor: Option<SystemTime>, b: &mut Bilanz) {
     match fs::symlink_metadata(dir) {
-        Ok(m) if m.file_attributes() & ATTR_REPARSE == 0 && m.is_dir() => leere(dir, b),
+        Ok(m) if m.file_attributes() & ATTR_REPARSE == 0 && m.is_dir() => leere(dir, vor, b),
         _ => {}
     }
 }
 
-fn leere(dir: &Path, b: &mut Bilanz) {
+/// Größe der Dateien, die seit `vor` unverändert sind (folgt keinen Verknüpfungen).
+pub fn alte_groesse(dir: &Path, vor: SystemTime) -> u64 {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter_map(|e| Some((e.path(), e.metadata().ok()?)))
+        .filter(|(_, m)| m.file_attributes() & ATTR_REPARSE == 0)
+        .map(|(p, m)| {
+            if m.is_dir() {
+                alte_groesse(&p, vor)
+            } else if m.modified().is_ok_and(|t| t <= vor) {
+                m.len()
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+fn leere(dir: &Path, vor: Option<SystemTime>, b: &mut Bilanz) {
     let Ok(rd) = fs::read_dir(dir) else {
         b.uebersprungen += 1;
         return;
@@ -149,6 +175,9 @@ fn leere(dir: &Path, b: &mut Bilanz) {
             continue;
         };
         let attr = m.file_attributes();
+        if attr & ATTR_ORDNER == 0 && vor.is_some_and(|v| m.modified().map_or(true, |t| t > v)) {
+            continue;
+        }
         if attr & ATTR_REPARSE != 0 {
             let r = if attr & ATTR_ORDNER != 0 {
                 fs::remove_dir(&p)
@@ -159,7 +188,7 @@ fn leere(dir: &Path, b: &mut Bilanz) {
                 b.uebersprungen += 1;
             }
         } else if attr & ATTR_ORDNER != 0 {
-            leere(&p, b);
+            leere(&p, vor, b);
             let _ = fs::remove_dir(&p); // bleibt stehen, wenn noch Dateien in Gebrauch sind
         } else {
             loesche_datei(&p, m, b);

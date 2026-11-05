@@ -1,15 +1,27 @@
 //! Bekannte Platzfresser: Auflösung der Pfade, Größe messen, aufräumen.
 
 use crate::scan::ordner_groesse;
-use crate::schutz::{basis, leere_ordner, loesche_datei_pfad, Bilanz, Schutz};
+use crate::schutz::{
+    alte_groesse, basis, leere_ordner, leere_ordner_vor, loesche_datei_pfad, Bilanz, Schutz,
+};
 use crate::win;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+/// Temp-Dateien erst ab diesem Alter (wie die Datenträgerbereinigung): laufende Programme legen ihre frisch an.
+pub const TEMP_TAGE: u64 = 7;
+
+fn temp_grenze() -> SystemTime {
+    SystemTime::now() - Duration::from_secs(TEMP_TAGE * 86_400)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Teil {
     /// Inhalt des Ordners löschen, der Ordner bleibt.
     Inhalt(PathBuf),
+    /// Wie Inhalt, aber nur Dateien älter als TEMP_TAGE.
+    Alt(PathBuf),
     Datei(PathBuf),
     /// Dateien `<präfix>*.db` direkt im Ordner.
     Muster(PathBuf, &'static str),
@@ -73,6 +85,7 @@ pub fn ziele(env: &dyn Fn(&str) -> Option<String>, schutz: &Schutz) -> Vec<Ziel>
     // Jeder Ordner, dessen Inhalt gelöscht wird, muss die Sperrliste passieren.
     let ok = |p: PathBuf| schutz.pruefe_aufraeumordner(&p).is_ok().then_some(p);
     let inhalt = |p: PathBuf| ok(p).map(Teil::Inhalt);
+    let alt = |p: PathBuf| ok(p).map(Teil::Alt);
     let win = basis(env("SystemRoot"));
     let local = basis(env("LOCALAPPDATA"));
     let lw = systemlaufwerk(env);
@@ -83,18 +96,18 @@ pub fn ziele(env: &dyn Fn(&str) -> Option<String>, schutz: &Schutz) -> Vec<Ziel>
         p.file_name()
             .is_some_and(|n| ["temp", "tmp"].contains(&n.to_string_lossy().to_lowercase().as_str()))
     };
-    if let Some(t) = basis(env("TEMP")).filter(ist_temp).and_then(inhalt) {
+    if let Some(t) = basis(env("TEMP")).filter(ist_temp).and_then(alt) {
         v.push(ziel(
             "Temporäre Dateien (Ihr Benutzer)",
-            "Reste, die Programme beim Arbeiten anlegen und danach nicht mehr brauchen.",
+            "Reste, die Programme beim Arbeiten anlegen und danach nicht mehr brauchen (älter als 7 Tage).",
             Art::Dateien(vec![t]),
             false,
         ));
     }
-    if let Some(t) = win.clone().and_then(|w| inhalt(w.join("Temp"))) {
+    if let Some(t) = win.clone().and_then(|w| alt(w.join("Temp"))) {
         v.push(ziel(
             "Temporäre Dateien (Windows)",
-            "Reste von Windows und von Installationen, die nicht mehr gebraucht werden.",
+            "Reste von Windows und von Installationen, die nicht mehr gebraucht werden (älter als 7 Tage).",
             Art::Dateien(vec![t]),
             true,
         ));
@@ -224,6 +237,7 @@ pub fn messen(z: &Ziel) -> Option<u64> {
             .iter()
             .map(|t| match t {
                 Teil::Inhalt(p) => ordner_groesse(p),
+                Teil::Alt(p) => alte_groesse(p, temp_grenze()),
                 Teil::Datei(p) => datei_groesse(p),
                 Teil::Muster(p, m) => muster_dateien(p, m).iter().map(|p| datei_groesse(p)).sum(),
             })
@@ -251,6 +265,7 @@ pub fn ausfuehren(z: &Ziel) -> Bilanz {
             for t in teile {
                 match t {
                     Teil::Inhalt(p) => leere_ordner(p, &mut b),
+                    Teil::Alt(p) => leere_ordner_vor(p, Some(temp_grenze()), &mut b),
                     Teil::Datei(p) => loesche_datei_pfad(p, &mut b),
                     Teil::Muster(p, m) => muster_dateien(p, m)
                         .iter()
@@ -362,6 +377,14 @@ mod tests {
             fs::create_dir_all(t.join(d)).unwrap();
         }
         fs::write(t.join("temp/unter/a.tmp"), vec![0u8; 40]).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(t.join("temp/unter/a.tmp"))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(8 * 86_400))
+            .unwrap();
+        // frisch: gehört einem laufenden Programm, bleibt
+        fs::write(t.join("temp/neu.tmp"), vec![0u8; 3]).unwrap();
         fs::write(
             t.join(r"local\Google\Chrome\User Data\Default\Cache\Cache_Data\f_1"),
             vec![0u8; 5],
@@ -395,11 +418,11 @@ mod tests {
 
         assert_eq!(
             finde("Temporäre Dateien (Ihr").art,
-            Art::Dateien(vec![Teil::Inhalt(t.join("temp"))])
+            Art::Dateien(vec![Teil::Alt(t.join("temp"))])
         );
         assert_eq!(
             finde("Temporäre Dateien (Win").art,
-            Art::Dateien(vec![Teil::Inhalt(t.join("win").join("Temp"))])
+            Art::Dateien(vec![Teil::Alt(t.join("win").join("Temp"))])
         );
         let ud = t.join(r"local\Google\Chrome\User Data");
         assert_eq!(
@@ -447,6 +470,10 @@ mod tests {
         let b = ausfuehren(finde("Temporäre Dateien (Ihr"));
         assert_eq!(b.frei, 40);
         assert!(t.join("temp").exists());
+        assert!(
+            t.join("temp/neu.tmp").exists(),
+            "frische Temp-Datei muss bleiben"
+        );
         fs::remove_dir_all(&t).unwrap();
     }
 
